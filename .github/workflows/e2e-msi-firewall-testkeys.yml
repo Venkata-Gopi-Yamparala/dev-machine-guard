@@ -1,0 +1,127 @@
+name: E2E MSI firewall (test-key build)
+
+# Not for merge. Builds a TEST-KEY MSI (build tag selfupdate_testkeys) at
+# product version 1.20.0 so an MSI host can be tested end to end against
+# unsigned on-device firewall builds: with DMG_TEST_FIREWALL_UNSIGNED=1 in the
+# SYSTEM environment the agent's firewall step skips the signed-checksum and
+# Authenticode checks (sha256, zip shape and version are still checked).
+# Release builds never carry the tag. The binaries are built the way
+# msi-smoke.yml builds them; only the tags and the version differ.
+
+on:
+  push:
+    branches: [e2e/msi-firewall-testkeys]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build the test-key MSI (1.20.0)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      E2E_VERSION: "1.20.0"
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@58077d3c7e43986b6b15fba718e8ea69e387dfcc # v2.15.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install WiX 4 + Util extension
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          wix --version
+          wix extension add --global WixToolset.Util.wixext/4.0.5
+
+      # The agent reports the MSI's version, as a release build does: the
+      # seed is installed under seed\1.20.0 and AgentVersion is 1.20.0, which
+      # meets FirstFirewallMSIVersion.
+      - name: Set the build version to 1.20.0
+        shell: pwsh
+        run: |
+          $f = "internal/buildinfo/version.go"
+          $c = Get-Content $f -Raw
+          $c = $c -replace '(Version\s*=\s*")[^"]+(")', "`${1}$env:E2E_VERSION`${2}"
+          Set-Content -Path $f -Value $c -NoNewline
+          Select-String -Path $f -Pattern 'Version\s*='
+
+      - name: Build Windows .exes (agent + launcher) with selfupdate_testkeys
+        shell: pwsh
+        run: |
+          $env:GOOS = "windows"
+          $env:GOARCH = "amd64"
+          $env:CGO_ENABLED = "0"
+          go build -trimpath -tags selfupdate_testkeys -ldflags "-s -w" `
+            -o "$PWD\stepsecurity-dev-machine-guard.exe" `
+            ./cmd/stepsecurity-dev-machine-guard
+          go build -trimpath -tags selfupdate_testkeys -ldflags "-s -w -H windowsgui" `
+            -o "$PWD\stepsecurity-dev-machine-guard-task.exe" `
+            ./cmd/stepsecurity-dev-machine-guard-task
+          $env:GOOS = "linux"
+          go build -trimpath -tags selfupdate_testkeys -ldflags "-s -w" `
+            -o "$PWD\dmg-linux" `
+            ./cmd/stepsecurity-dev-machine-guard
+          $env:GOOS = "windows"
+          Get-Item "$PWD\stepsecurity-dev-machine-guard.exe", "$PWD\stepsecurity-dev-machine-guard-task.exe", "$PWD\dmg-linux" |
+            Select-Object Name, Length
+          $v = & "$PWD\stepsecurity-dev-machine-guard.exe" --version
+          Write-Host "agent --version: $v"
+          if ("$v" -notmatch [regex]::Escape($env:E2E_VERSION)) { Write-Host "::error::agent does not report $env:E2E_VERSION"; exit 1 }
+          if (-not (Select-String -Path "$PWD\stepsecurity-dev-machine-guard.exe" -Pattern 'DMG_TEST_FIREWALL_UNSIGNED' -SimpleMatch -Quiet)) {
+            Write-Host "::error::the agent is not a test-key build"; exit 1
+          }
+
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          wix build packaging/windows/Product.wxs `
+            -arch x64 `
+            -ext WixToolset.Util.wixext `
+            -d Arch=x64 `
+            -d "Version=$env:E2E_VERSION" `
+            -d "BinaryPath=$PWD\stepsecurity-dev-machine-guard.exe" `
+            -d "LauncherPath=$PWD\stepsecurity-dev-machine-guard-task.exe" `
+            -d "LinuxBinaryPath=$PWD\dmg-linux" `
+            -out "dist\stepsecurity-dev-machine-guard-$env:E2E_VERSION-testkeys-x64.msi"
+          Get-Item dist\*.msi | Select-Object Name, Length
+
+      # Sanity: install with a synthetic tenant (invalid endpoint), check the
+      # registry value the firewall gate reads, uninstall.
+      - name: Install, check AgentVersion, uninstall
+        shell: pwsh
+        run: |
+          $msi = (Get-Item dist\*.msi).FullName
+          $p = Start-Process msiexec.exe -ArgumentList @("/i", $msi, "/qn", "/norestart",
+            "CUSTOMERID=ci-e2e", "APIENDPOINT=https://api.invalid.example", "APIKEY=ci-e2e-fake-key",
+            "AUTOUPDATE=0", "INSTALLONDEVICEFIREWALL=1", "/l*v", "dist\install.log") -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content dist\install.log -Tail 60; exit 1 }
+          $av = (Get-ItemProperty 'HKLM:\Software\StepSecurity' -Name AgentVersion).AgentVersion
+          Write-Host "AgentVersion = $av"
+          $cfg = Get-Content "C:\ProgramData\StepSecurity\config.json" -Raw | ConvertFrom-Json
+          Write-Host "install_on_device_firewall = $($cfg.install_on_device_firewall); auto_update = $($cfg.auto_update)"
+          $ok = ($av -eq $env:E2E_VERSION) -and ($cfg.install_on_device_firewall -eq $true) -and ($cfg.auto_update -eq $false)
+          $p = Start-Process msiexec.exe -ArgumentList @("/x", $msi, "/qn", "/norestart", "/l*v", "dist\uninstall.log") -Wait -PassThru
+          Write-Host "uninstall exit: $($p.ExitCode)"
+          if (-not $ok) { Write-Host "::error::unexpected AgentVersion or config"; exit 1 }
+
+      - name: Upload the MSI and binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dmg-msi-1.20.0-testkeys-x64
+          path: |
+            dist/*.msi
+            stepsecurity-dev-machine-guard.exe
+            stepsecurity-dev-machine-guard-task.exe
+          if-no-files-found: error
